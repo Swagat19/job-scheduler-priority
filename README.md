@@ -1,141 +1,184 @@
-# Distributed Job Scheduler
+# Job Scheduler with Priority Queues
 
-A robust, scalable distributed job scheduling system built with Go, Python, Redis, PostgreSQL, and monitored with Prometheus & Grafana.
+A distributed job scheduling system written in Go and Python, with Redis-backed
+priority queues, lease-based at-least-once delivery, exponential-backoff retries,
+a dead-letter queue, and full Prometheus + Grafana observability.
 
-![Design Architecture](docs/architecture-diagram.png)
-*System Architecture Diagram*
+> **Attribution.** This project is built on top of
+> [soum-sr/distributed_job_scheduler](https://github.com/soum-sr/distributed_job_scheduler),
+> which provides the base FIFO architecture (coordinator, workers, lease monitor,
+> heartbeat verifier, retry/DLQ pipeline). My contributions are listed below; the
+> rest is upstream code I am studying, extending, and operating.
 
-## Features
+---
 
-### Core Functionality
-- **Distributed Job Processing**: Horizontal scaling with multiple worker nodes
-- **Job Leasing**: Prevents duplicate processing with timeout-based leasing
-- **Dead Letter Queue (DQL)**: Handles permanently failed jobs after max retries
-- **Exponential Backoff**: Retry mechanism with exponentially increasing delay + jitter to prevent thundering herd
-- **Load Balancing**: Least Recently Used (LRU) worker selection algorithm
+## My Contributions
 
-### Reliability & Resilience
-- **Worker Health Monitoring**: Automatic heartbeat verification and state management
-- **Lease Timeout Recovery**: Automatic job recovery when worker becomes unavailable
-- **Graceful Failure Handling**: Comprehensive error handling and job retry logic
-- **Atomic Operations**: Database transactions ensure data consistency
+> _(Filled in as the project evolves — kept honest and specific so each item maps
+> to a real commit. WIP — see roadmap at the bottom.)_
 
-### Observability
-- **Prometheus Metrics**: Comprehensive system metrics collection
-- **Grafana Dashboard**: Real-time visualization of system performance and health
+- [ ] **Priority-based dispatch** — replace Redis FIFO list with a sorted set
+      (`ZADD` / `BZPOPMIN`); 10 priority levels with FIFO tiebreaking via
+      timestamp suffix on the score.
+- [ ] **Schema migration** — add `priority` column to `jobs` (indexed) and
+      surface it on the submitter API.
+- [ ] **Benchmark suite** — reproducible load tests measuring throughput,
+      p50 / p95 / p99 latency, and high-priority head-of-line latency.
+- [ ] **Grafana panels** — jobs-by-priority counter, priority-aware queue depth.
 
-![Grafana Dashboard](docs/grafana-dashboard.png)
-*Grafana Dashboard*
+---
 
 ## Architecture
 
-### Components
+Seven services orchestrated via Docker Compose:
 
-1. **Coordinator (Go)**: Central orchestrator managing job distribution and worker coordination
-2. **Worker (Python)**: Asynchronous job processors with realistic workload simulations
-3. **Submitter (Go)**: REST API for job submission
-4. **Redis**: Message queue for job distribution, result collection and dead letter queue
-5. **PostgreSQL**: Persistent storage for jobs and workers
-6. **Prometheus**: Metrics collection server
-7. **Grafana**: Visualization and monitoring dashboard
+| Service       | Tech                          | Role                                                      |
+| ------------- | ----------------------------- | --------------------------------------------------------- |
+| Submitter     | Go (`:8000`)                  | REST API; persists job to Postgres, enqueues to Redis     |
+| Coordinator   | Go (`:9000`)                  | LRU worker selection, lease management, retry/DLQ logic   |
+| Worker × 3    | Python + FastAPI (`:7001-3`)  | Pulls and processes jobs; sends heartbeats; reports back  |
+| Postgres      | `:5432`                       | Durable store for `jobs` and `workers` tables             |
+| Redis         | `:6379`                       | Queues (ready / results / DLQ) and worker heartbeats      |
+| Prometheus    | `:9090`                       | Scrapes metrics from coordinator and workers              |
+| Grafana       | `:3000`                       | Pre-provisioned monitoring dashboard                      |
+
+Job lifecycle (happy path):
+
+```
+client ──POST /submit_job──► Submitter ──INSERT──► Postgres
+                                  │
+                                  └──ZADD job_queue (priority, ts)──► Redis
+                                                                        │
+                                Coordinator ◄──BZPOPMIN job_queue───────┘
+                                  │
+                                  ├── pick LRU worker (FOR UPDATE)
+                                  ├── UPDATE jobs SET status='leased', lease_start=NOW()
+                                  └──POST /run_job──► Worker
+                                                        │
+                                                        ├── execute simulator
+                                                        └──LPUSH job_results──► Redis
+                                                                                  │
+                                Coordinator ◄──BRPOP job_results──────────────────┘
+                                  │
+                                  └── UPDATE jobs SET status='completed' / retry / DLQ
+```
+
+Resilience:
+
+- **Lease timeouts** — if a worker dies mid-job, the lease monitor reclaims the
+  job after `lease_timeout` seconds and requeues with exponential backoff + jitter.
+- **Heartbeats** — workers `SET worker:<url> alive EX 30` every 10s; the
+  heartbeat verifier flips missing workers to `unavailable`, removing them
+  from LRU selection.
+- **Dead Letter Queue** — jobs that exhaust `MAX_RETRIES` land in
+  `dead_letter_queue` for inspection (placeholder for alerting).
+
+---
 
 ## Quick Start
 
 ### Prerequisites
-- Docker & Docker Compose
-- Go 1.21+ (for local development)
-- Python 3.9+ (for local development)
 
-### 1. Clone Repository
-```bash
-git clone https://github.com/soum-sr/distributed_job_scheduler.git
-cd distributed_job_scheduler
-```
+- Docker + Docker Compose
+- Go 1.21+ (only for local dev outside containers)
+- Python 3.9+ (only for local dev outside containers)
 
-### 2. Start Services
+### Boot the stack
+
 ```bash
 make up
 ```
 
-### 3. Access Services 
-- **Submitter API**: http://localhost:8000 
-- **Coordinator**: http://localhost:9000 
-- **Grafana Dashboard**: http://localhost:3000 (admin/admin) 
-- **Prometheus**: http://localhost:9090 
-- **PostgreSQL**: localhost:5432
-- **Redis**: localhost:6379
+### Service URLs
 
-### 4. Submitting Jobs
+| What             | URL                                           |
+| ---------------- | --------------------------------------------- |
+| Submitter API    | http://localhost:8000                         |
+| Coordinator      | http://localhost:9000                         |
+| Grafana          | http://localhost:3000  (admin / admin)        |
+| Prometheus       | http://localhost:9090                         |
+| Postgres         | `localhost:5432`  (scheduler_user/scheduler_password) |
+| Redis            | `localhost:6379`                              |
 
-Use the below curl command sample to submit a cpu_intensive job. More test jobs are present under: ```distributed_job_scheduler/scripts```
+### Submit a job
 
 ```bash
-
 curl -X POST http://localhost:8000/submit_job \
   -H "Content-Type: application/json" \
-  -d '{"name": "cpu_intensive", "payload": "test task"}'
-
+  -d '{"name": "cpu_intensive", "payload": "task1"}'
 ```
-## Monitoring & Observability
 
-### Grafana Dashboard The system includes a pre-configured Grafana dashboard showing: 
-- **Job Processing Rates**: Real time job completion/failure rates 
-- **Job Total Counts**: Cumulative completed, failed, and timeout jobs 
-- **Worker Status**: Active workers by state (available/busy/unavailable) 
-- **Queue Metrics**: Jobs in queue and dead letter queue 
-- **Processing Duration**: Job execution time percentiles 
-- **Retry Patterns**: Retry attempt distributions by failure reason 
-- **Lease Timeouts**: Worker unresponsiveness incidents 
+Once priority dispatch lands, jobs accept a `priority` field (1 = highest, 10 = lowest):
 
-
-
-## Project Structure
+```bash
+curl -X POST http://localhost:8000/submit_job \
+  -H "Content-Type: application/json" \
+  -d '{"name": "cpu_intensive", "payload": "urgent", "priority": 1}'
 ```
-.
-├── Makefile
-├── README.md
-├── coordinator
-│   ├── Dockerfile
-│   ├── go.mod
-│   ├── go.sum
-│   ├── handlers.go
-│   ├── jobs.go
-│   ├── main.go
-│   ├── metrics.go
-│   ├── utils.go
-│   └── worker.go
-├── deploy
-│   ├── docker-compose.yml
-│   ├── grafana
-│   │   └── provisioning
-│   │       ├── dashboards
-│   │       │   ├── dashboard.yml
-│   │       │   └── dashboard_content.json
-│   │       └── datasources
-│   │           └── prometheus.yml
-│   ├── initdb
-│   │   └── 01_schema.sql
-│   └── prometheus
-│       └── prometheus.yml
-├── docs
-│   └── architecture-diagram.png
-├── go.work
-├── go.work.sum
-├── scripts
-│   ├── high_volume_stress_test.sh
-│   ├── send_cpu_intensive_jobs.sh
-│   ├── send_failing_jobs.sh
-│   ├── send_io_intensive_jobs.sh
-│   └── send_network_intensive_jobs.sh
-├── submitter
-│   ├── Dockerfile
-│   ├── go.mod
-│   ├── go.sum
-│   └── main.go
-└── worker
-    ├── Dockerfile
-    └── main.py
 
-12 directories, 31 files
+### Sample workloads
 
+```bash
+make submit-test-jobs                    # 3 mixed jobs
+./scripts/send_cpu_intensive_jobs.sh     # 10 CPU-bound
+./scripts/send_io_intensive_jobs.sh      # 10 IO-bound
+./scripts/send_failing_jobs.sh           # exercise retry + DLQ
+./scripts/high_volume_stress_test.sh     # throughput stress
 ```
+
+### Inspect state live
+
+```bash
+# Postgres
+docker exec -it postgres psql -U scheduler_user -d scheduler_db \
+  -c "SELECT id, name, status, retries, leased_to_worker FROM jobs ORDER BY id DESC LIMIT 10;"
+
+# Redis
+docker exec -it redis redis-cli LLEN job_queue
+docker exec -it redis redis-cli LLEN dead_letter_queue
+docker exec -it redis redis-cli KEYS 'worker:*'
+```
+
+### Tear down
+
+```bash
+make down       # stop containers
+make clean      # remove containers + volumes + images
+```
+
+---
+
+## Job Types (Worker Simulators)
+
+The worker (`worker/main.py`) ships with five simulators selected by `name`:
+
+| `name`              | Workload                                          |
+| ------------------- | ------------------------------------------------- |
+| `cpu_intensive`     | SHA-256 hashing, 5k–15k iterations in thread pool |
+| `io_intensive`      | Write/read/delete a 1k–10k line file              |
+| `mixed_workload`    | CPU + IO chained                                  |
+| `network_task`      | 1–5 concurrent HTTP calls to httpbin.org/delay    |
+| _anything else_     | Random sleep ("variable work")                    |
+
+Sending `payload: "invalid_job"` forces a deterministic failure — useful for
+exercising the retry + DLQ path.
+
+---
+
+## Roadmap
+
+- [x] Initial import + attribution
+- [ ] Priority queue (Redis sorted set)
+- [ ] Benchmark scripts + result tables
+- [ ] Coordinator HA via Redis leader election
+- [ ] Real (non-simulated) job execution: register Python callables by name
+- [ ] gRPC between coordinator and workers
+- [ ] Web UI for job/worker inspection
+
+---
+
+## License
+
+Same as the upstream project. See
+[soum-sr/distributed_job_scheduler](https://github.com/soum-sr/distributed_job_scheduler)
+for original license terms.
