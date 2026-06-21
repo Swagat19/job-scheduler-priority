@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/go-redis/redis"
 )
 
 func updateWorkerState(workerUrl string, state string) error {
@@ -129,9 +131,12 @@ func sendJobToWorker(workerUrl string, job Job) {
 		fmt.Println("Error sending job to worker", workerUrl, err)
 		// Mark worker as unavailable
 		updateWorkerState(workerUrl, "unavailable")
-		// Requeue the job
+		// Requeue the job (priority-aware).
 		jobJson, _ := json.Marshal(job)
-		redisClient.LPush("job_queue", jobJson)
+		redisClient.ZAdd("job_queue", redis.Z{
+			Score:  priorityScore(job.Priority),
+			Member: jobJson,
+		})
 		return
 	}
 
@@ -146,10 +151,13 @@ func sendJobToWorker(workerUrl string, job Job) {
 		fmt.Println("Successfully sent job:", job.ID, "to worker:", workerUrl, "response: ", string(body))
 	} else {
 		fmt.Println("worker: ", workerUrl, "returned error for job: ", job.ID, "status:", resp.StatusCode, "body:", string(body))
-		// Requeue the job if worker rejected
+		// Requeue the job if worker rejected (priority-aware).
 		time.Sleep(5 * time.Second)
 		jobJson, _ := json.Marshal(job)
-		redisClient.LPush("job_queue", jobJson)
+		redisClient.ZAdd("job_queue", redis.Z{
+			Score:  priorityScore(job.Priority),
+			Member: jobJson,
+		})
 	}
 }
 

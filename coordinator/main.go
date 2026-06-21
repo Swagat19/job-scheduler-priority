@@ -23,9 +23,10 @@ type Worker struct {
 }
 
 type Job struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Payload string `json:"payload"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Payload  string `json:"payload"`
+	Priority int    `json:"priority,omitempty"`
 }
 
 const (
