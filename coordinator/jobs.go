@@ -11,13 +11,20 @@ import (
 
 func distributeJobs() {
 	for {
-		// BRPop (Blocking Right Pop), 0 -> wait forever until a new item is available
-		result, err := redisClient.BRPop(0, "job_queue").Result()
+		// BZPopMin (Blocking Pop Min): block until the lowest-score member
+		// of the sorted set is available. Lowest score = highest dispatch
+		// priority; FIFO within a priority band via the timestamp suffix.
+		result, err := redisClient.BZPopMin(0, "job_queue").Result()
 		if err != nil {
 			fmt.Println("Error: ", err)
 			continue
 		}
-		jobJson := result[1]
+		// Member is stored as a string (the JSON we ZAdded).
+		jobJson, ok := result.Member.(string)
+		if !ok {
+			fmt.Printf("Error: unexpected member type from BZPopMin: %T\n", result.Member)
+			continue
+		}
 		fmt.Println("Received job:", jobJson)
 
 		// Parse the job
@@ -32,7 +39,10 @@ func distributeJobs() {
 		if workerUrl == "" || err != nil {
 			fmt.Println("No available worker found, requeueing job after delay")
 			time.Sleep(5 * time.Second)
-			redisClient.LPush("job_queue", jobJson)
+			redisClient.ZAdd("job_queue", redis.Z{
+				Score:  priorityScore(job.Priority),
+				Member: jobJson,
+			})
 			continue
 		}
 
@@ -213,9 +223,11 @@ func processJobResults() {
 }
 
 func requeueFailedJob(jobID string) {
-	// Get job details from database
+	// Get job details from database (including priority so the score is preserved)
 	var job Job
-	err := db.QueryRow("SELECT id, name, payload FROM jobs WHERE id = $1", jobID).Scan(&job.ID, &job.Name, &job.Payload)
+	err := db.QueryRow(
+		"SELECT id, name, payload, priority FROM jobs WHERE id = $1", jobID,
+	).Scan(&job.ID, &job.Name, &job.Payload, &job.Priority)
 	if err != nil {
 		fmt.Printf("Error fetching job %s for requeue: %v\n", jobID, err)
 		return
@@ -231,10 +243,13 @@ func requeueFailedJob(jobID string) {
 		return
 	}
 
-	// Add back to job queue
+	// Add back to the priority-ordered queue.
 	jobJson, _ := json.Marshal(job)
-	redisClient.LPush("job_queue", jobJson)
-	fmt.Printf("Requeued failed job %s\n", jobID)
+	redisClient.ZAdd("job_queue", redis.Z{
+		Score:  priorityScore(job.Priority),
+		Member: jobJson,
+	})
+	fmt.Printf("Requeued failed job %s (priority %d)\n", jobID, job.Priority)
 }
 
 func sendToDeadLetterQueue(jobID string, jobResult map[string]interface{}) {
@@ -281,7 +296,7 @@ func processDLQ() {
 func leaseMonitor() {
 	for {
 		rows, err := db.Query(`
-			SELECT id, name, payload, retries FROM jobs
+			SELECT id, name, payload, priority, retries FROM jobs
 			WHERE status = 'leased'
 			AND lease_start + (lease_timeout || ' seconds')::interval < NOW()
 		`)
@@ -302,7 +317,7 @@ func leaseMonitor() {
 				Job
 				Retries int
 			}
-			if err := rows.Scan(&job.ID, &job.Name, &job.Payload, &job.Retries); err != nil {
+			if err := rows.Scan(&job.ID, &job.Name, &job.Payload, &job.Priority, &job.Retries); err != nil {
 				fmt.Println("Error scanning job row:", err)
 				continue
 			}
@@ -360,12 +375,15 @@ func leaseMonitor() {
 					continue
 				}
 
-				// Schedule requeue with delay
+				// Schedule requeue with delay (priority-aware).
 				go func(job Job, delay time.Duration) {
 					time.Sleep(delay)
 					jobJson, _ := json.Marshal(job)
-					redisClient.LPush("job_queue", jobJson)
-					fmt.Printf("Requeued expired job %s after backoff\n", job.ID)
+					redisClient.ZAdd("job_queue", redis.Z{
+						Score:  priorityScore(job.Priority),
+						Member: jobJson,
+					})
+					fmt.Printf("Requeued expired job %s (priority %d) after backoff\n", job.ID, job.Priority)
 				}(expiredJob.Job, delay)
 
 			}

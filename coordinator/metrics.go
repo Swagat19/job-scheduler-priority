@@ -83,11 +83,11 @@ func updateMetrics() {
 			rows.Close()
 		}
 
-		// Update jobs in queue
-		queueLength := redisClient.LLen("job_queue").Val()
+		// Update jobs in queue (sorted set after the priority-queue migration).
+		queueLength := redisClient.ZCard("job_queue").Val()
 		jobsInQueue.Set(float64(queueLength))
 
-		// Update jobs in DLQ
+		// DLQ remains a list (drain semantics rely on BRPOP/LPUSH).
 		dlqLength := redisClient.LLen(DLQ_QUEUE).Val()
 		jobsInDLQ.Set(float64(dlqLength))
 

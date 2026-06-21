@@ -11,8 +11,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     completed_at TIMESTAMP,
     retries INT DEFAULT 0,
     max_retries INT DEFAULT 3,
-    result TEXT
+    result TEXT,
+    priority INT DEFAULT 5 CHECK (priority BETWEEN 1 AND 10)
 );
+
+CREATE INDEX IF NOT EXISTS idx_jobs_priority_status ON jobs (priority, status);
 
 CREATE TABLE IF NOT EXISTS workers (
     id SERIAL PRIMARY KEY,
